@@ -47,6 +47,8 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class VoBLEGatewayService extends Service implements VoBLEGattServer.Listener {
     private static final String CHANNEL_ID = "airsim_voble";
     private static final int NOTIFICATION_ID = 4108;
+    private static final com.airsim.phonecontrol.ServiceStartGate START_GATE =
+            new com.airsim.phonecontrol.ServiceStartGate();
     private static volatile VoBLEGatewayService instance;
     private static volatile VoBLEDiagnostics.Snapshot diagnostics =
             VoBLEDiagnostics.idle("Android");
@@ -102,6 +104,7 @@ public final class VoBLEGatewayService extends Service implements VoBLEGattServe
     private volatile SessionContext session;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final AtomicLong advertisingRetries = new AtomicLong();
+    private final VoBLERecoveryRequest recoveryRequest = new VoBLERecoveryRequest();
     private final Runnable advertisingRetry = () -> {
         if (destroyed) return;
         if (gatt == null || !gatt.hasBluetoothPermissions()) return;
@@ -128,13 +131,18 @@ public final class VoBLEGatewayService extends Service implements VoBLEGattServe
 
     public static void start(Context context) {
         if (!hasPermissions(context)) return;
-        Intent intent = new Intent(context, VoBLEGatewayService.class);
         try {
-            if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(intent);
-            else context.startService(intent);
+            var result = START_GATE.request(() -> {
+                Intent intent = new Intent(context, VoBLEGatewayService.class);
+                return (Build.VERSION.SDK_INT >= 26 ? context.startForegroundService(intent)
+                        : context.startService(intent)) != null;
+            });
+            VoBLEGatewayService active = instance;
+            if (result == com.airsim.phonecontrol.ServiceStartGate.Result.RUNNING && active != null) {
+                active.recoveryRequest.request(active.mainHandler::post,
+                        () -> instance == active && !active.destroyed, active::recoverAdvertising);
+            }
         } catch (IllegalStateException | SecurityException restricted) {
-            // Application/boot may run in the background. Retry when the Activity resumes;
-            // do not let an expected platform restriction kill the app or clear pairing.
             BridgeLog.error("voble_service_start_deferred", restricted);
         }
     }
@@ -169,6 +177,7 @@ public final class VoBLEGatewayService extends Service implements VoBLEGattServe
     @Override public void onCreate() {
         super.onCreate();
         instance = this;
+        START_GATE.created(this);
         createNotificationChannel();
         Notification notification = new Notification.Builder(this, CHANNEL_ID)
                 .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
@@ -208,12 +217,19 @@ public final class VoBLEGatewayService extends Service implements VoBLEGattServe
     }
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
+        recoverAdvertising();
+        return START_STICKY;
+    }
+
+    // Main thread only. GATT.start() is a no-op while its server is healthy;
+    // do not close GATT, authentication, or media to repair advertising.
+    private void recoverAdvertising() {
+        if (destroyed) return;
         advertisingRetries.set(0);
         mainHandler.removeCallbacks(advertisingRetry);
         if (gatt != null && gatt.hasBluetoothPermissions() && !gatt.start()) {
             BridgeLog.info("voble_gatt_start_deferred");
         }
-        return START_STICKY;
     }
 
     @Override public void onAdvertisingReady() {
@@ -222,6 +238,7 @@ public final class VoBLEGatewayService extends Service implements VoBLEGattServe
     }
 
     @Override public void onAdvertisingFailed(int code) {
+        if (destroyed) return;
         mainHandler.removeCallbacks(advertisingRetry);
         long attempt = advertisingRetries.incrementAndGet();
         if (attempt > 3) {
@@ -237,10 +254,12 @@ public final class VoBLEGatewayService extends Service implements VoBLEGattServe
     @Override public IBinder onBind(Intent intent) { return null; }
 
     @Override public void onPairingWrite(String deviceId, byte[] value) {
-        controlQueue.execute(() -> handlePairing(deviceId, value));
+        long epoch = channel.epoch();
+        controlQueue.execute(() -> handlePairing(deviceId, value, epoch));
     }
 
-    private void handlePairing(String deviceId, byte[] value) {
+    private void handlePairing(String deviceId, byte[] value, long epoch) {
+        if (destroyed || epoch != channel.epoch()) return;
         try {
             JSONObject request = new JSONObject(new String(value, StandardCharsets.UTF_8));
             String operation = request.optString("op", "");
@@ -281,7 +300,7 @@ public final class VoBLEGatewayService extends Service implements VoBLEGattServe
                             decode(request.getString("iphone_nonce")),
                             request.getString("sas"), System.currentTimeMillis());
                 }
-                if (!channel.authenticate(deviceId)) throw new SecurityException("another central owns VoBLE");
+                if (!channel.authenticate(deviceId, epoch)) throw new SecurityException("VoBLE connection was retired or owned by another central");
                 peerIdentities.put(deviceId, identity);
                 diagnostics = new VoBLEDiagnostics.Snapshot(
                         RuntimeMode.agentLabel(this), true, false, "G.711-mu/8000/mono",
@@ -361,7 +380,7 @@ public final class VoBLEGatewayService extends Service implements VoBLEGattServe
                         .put("call_generation", calls.currentGeneration())
                         .put("phone_number", AndroidAgentIdentity.phoneNumber(this))
                         .put("sim_slots", SimSlotJson.slots(this)).toString());
-            } else if ("start_media".equals(action)) {
+            } else if ("start_media".equals(action) || "start_early_media".equals(action)) {
                 result = calls.executeOnce(request, true,
                         ignored -> startMedia(deviceId, identity, envelope));
             } else if ("stop_media".equals(action)) {
@@ -416,7 +435,8 @@ public final class VoBLEGatewayService extends Service implements VoBLEGattServe
     }
 
     @Override public void onDisconnected(String deviceId) {
-        controlQueue.execute(() -> {
+        if (destroyed) return;
+        try { controlQueue.execute(() -> {
             BridgeLog.info("voble_peer_disconnected");
             peerIdentities.remove(deviceId);
             SessionContext value = session;
@@ -426,7 +446,10 @@ public final class VoBLEGatewayService extends Service implements VoBLEGattServe
             }
             pendingPairingCode = "";
             diagnostics = VoBLEDiagnostics.idle(RuntimeMode.agentLabel(this));
-        });
+        }); } catch (java.util.concurrent.RejectedExecutionException error) {
+            // close() also retires peers during onDestroy, after queues shut down.
+            if (!destroyed) throw error;
+        }
     }
 
     private void publishCallState(String callId, String direction, String state, String number) {
@@ -454,6 +477,10 @@ public final class VoBLEGatewayService extends Service implements VoBLEGattServe
         }
         if (generation == null) return;
         boolean terminal = calls.observeCall(callId, generation, state);
+        VoBLEMediaSession earlySession = media;
+        if (earlySession != null && earlySession.receiveOnly() && !"dialing".equals(state)) {
+            stopMedia(callId, generation);
+        }
         synchronized (mediaLifecycleLock) {
             VoBLEMediaSession current = media;
             if (!destroyed && !terminal && current != null && mediaIdentity != null
@@ -498,6 +525,12 @@ public final class VoBLEGatewayService extends Service implements VoBLEGattServe
         if (!calls.ownsCall(envelope.callId(), envelope.generation())) {
             return VoBLECallController.Result.failure("call_mismatch");
         }
+        boolean early = "start_early_media".equals(envelope.command());
+        if (early && (!com.airsim.phonecontrol.AndroidEarlyMedia.supported(this)
+                || !CallRepository.earlyMediaEligible(envelope.callId())
+                || CallRepository.state(envelope.callId()) != android.telecom.Call.STATE_DIALING)) {
+            return VoBLECallController.Result.failure("early_media_unavailable");
+        }
         try {
             InetSocketAddress endpoint;
             if (RuntimeMode.isStandalone(this)) {
@@ -511,19 +544,32 @@ public final class VoBLEGatewayService extends Service implements VoBLEGattServe
             VoBLEPairingManager.SessionKeys keys = pairingManager.storedSessionKeys(
                     peerIdentity, envelope.sessionId(), envelope.callId(), envelope.generation());
             byte[] mediaKey = keys.media();
+            if (early) {
+                String nonce = new JSONObject(new String(envelope.ciphertext(), StandardCharsets.UTF_8)).optString("number");
+                byte[] derived = VoBLEMediaSession.earlyMediaKey(mediaKey, nonce);
+                Arrays.fill(mediaKey, (byte) 0);
+                mediaKey = derived;
+            }
             try {
                 stopMedia("", 0);
                 VoBLEMediaSession next = new VoBLEMediaSession(
                         endpoint,
                         address -> VoBLEPCMBridgeSession.open(
-                                address, VoBLEPCMBridgeSession.socketConnector()),
+                                address, VoBLEPCMBridgeSession.socketConnector(), early),
                         packet -> gatt.notifyAudioPacket(deviceId, packet),
                         failed -> {
                             RemoteAudioSessionRegistry.releaseCall(failed);
                             try {
                                 controlQueue.execute(() -> {
                                     // Delayed failure from an old call cannot stop its replacement.
-                                    if (media == failed) stopMedia("", 0);
+                                    if (media == failed) {
+                                        if (early) {
+                                            try { sendControl(deviceId, envelope.sessionId(), envelope.callId(),
+                                                    envelope.generation(), "early_media_stopped", new JSONObject()); }
+                                            catch (Exception ignored) { /* BLE disconnect cleanup still applies. */ }
+                                        }
+                                        stopMedia("", 0);
+                                    }
                                 });
                             } catch (java.util.concurrent.RejectedExecutionException destroyed) {
                                 // Service teardown already releases/cleans up its current media.
@@ -531,12 +577,19 @@ public final class VoBLEGatewayService extends Service implements VoBLEGattServe
                         });
                 VoBLEMediaSession.Identity identity = new VoBLEMediaSession.Identity(
                         envelope.callId(), envelope.generation());
+                final long earlyDeadline = System.nanoTime() + 120_000_000_000L;
+                if (early) next.setCaptureAllowed(() -> System.nanoTime() < earlyDeadline
+                        && calls.ownsCall(envelope.callId(), envelope.generation())
+                        && CallRepository.earlyMediaEligible(envelope.callId())
+                        && CallRepository.state(envelope.callId()) == android.telecom.Call.STATE_DIALING);
                 next.start(identity, mediaKey);
                 synchronized (mediaLifecycleLock) {
                     synchronized (next) {
                         // Socket reads may complete after shutdownNow; publication
                         // and service teardown must share the same lifecycle lock.
-                        if (destroyed || !next.ready()) {
+                        if (destroyed || !next.ready() || !calls.ownsCall(envelope.callId(), envelope.generation())
+                                || (early && (!CallRepository.earlyMediaEligible(envelope.callId())
+                                || CallRepository.state(envelope.callId()) != android.telecom.Call.STATE_DIALING))) {
                             next.close();
                             throw new java.io.IOException("PCM gateway stopped during startup");
                         }
@@ -553,7 +606,7 @@ public final class VoBLEGatewayService extends Service implements VoBLEGattServe
                         0, 0, 0, "");
                 publishDiagnostics();
                 BridgeLog.info("voble_media_started call_generation=" + envelope.generation());
-                return VoBLECallController.Result.success("media_ready");
+                return VoBLECallController.Result.success(early ? "early_media_ready_v1" : "media_ready");
             } finally {
                 Arrays.fill(mediaKey, (byte) 0);
             }
@@ -717,6 +770,7 @@ public final class VoBLEGatewayService extends Service implements VoBLEGattServe
             stopMedia("", 0);
         }
         if (instance == this) instance = null;
+        START_GATE.destroyed(this);
         pendingPairingCode = "";
         diagnostics = VoBLEDiagnostics.idle(RuntimeMode.agentLabel(this));
         mainHandler.removeCallbacks(advertisingRetry);

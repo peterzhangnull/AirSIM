@@ -582,6 +582,9 @@ struct AirSIMSettingsView: View {
     @State private var updateViewVisible = false
     @AppStorage(ConnectionModePreference.key) private var connectionModeRaw = ConnectionModePreference.selected().rawValue
     @AppStorage(CloudSignalingPreference.key) private var cloudSignalingEnabled = CloudSignalingPreference.isEnabled()
+    @AppStorage(CarrierRingbackPreference.key) private var carrierRingbackEnabled = true
+    @AppStorage(CloudAudioBufferPolicy.modeKey) private var cloudAudioBufferMode = "automatic"
+    @AppStorage(CloudAudioBufferPolicy.millisecondsKey) private var cloudAudioBufferMilliseconds = 720
     @AppStorage(BackgroundStandbyPreference.key) private var backgroundStandbyEnabled = false
     @AppStorage(LiveActivityVisibilityPreference.key) private var liveActivityEnabled = true
     @AppStorage(SMSVerificationCodeClipboard.enabledKey) private var autoCopySMSCode = true
@@ -758,6 +761,7 @@ struct AirSIMSettingsView: View {
                 Text(updateCallBusy ? "通话结束后可切换。" : pureLocalEnabled
                     ? "纯本地已开启，自动模式只尝试本地链路。" : "这是连接偏好，实际链路以设备状态为准；不影响手动云端自检。")
             }
+            cloudAudioBufferSection
         case .add:
             Section {
                 Text("先在安卓 AirSIM 打开一次性配对窗口，再选择连接方式。")
@@ -806,6 +810,13 @@ struct AirSIMSettingsView: View {
             } footer: {
                 Text(pureLocalEnabled ? "纯本地模式已阻止云端通知，关闭后恢复原偏好。" : "用于后台来电通知，不改变通话的音频连接方式。")
             }
+            Section {
+                Toggle("运营商接通前语音", isOn: $carrierRingbackEnabled)
+                    .disabled(model.callLifecycleSnapshot.state != .idle && !model.callLifecycleSnapshot.state.isTerminal)
+                    .accessibilityIdentifier("carrierRingback")
+            } footer: {
+                Text("适用于 VoWLAN、蓝牙与云端。设备提供音频时播放，尚未接通不计时；关闭后使用本地等待音。通话期间不可更改。")
+            }
             smsSection
             Section {
                 link(.background, "moon")
@@ -826,6 +837,9 @@ struct AirSIMSettingsView: View {
             } else { deviceOrderSection }
         case .preferences:
             Section {
+                Picker("主题", selection: $settings.theme) {
+                    ForEach(AppTheme.allCases) { theme in Text(theme.title).tag(theme) }
+                }
                 Picker("外观", selection: $settings.appearance) {
                     ForEach(AppAppearance.allCases) { Text($0.title).tag($0) }
                 }
@@ -994,7 +1008,31 @@ struct AirSIMSettingsView: View {
             } footer: {
                 Text(pureLocalEnabled ? "纯本地模式已阻止 Relay，请先关闭纯本地模式。" : "保存地址与设备注册是不同步骤。当前未使用云端通话，也可手动自检。")
             }
+            cloudAudioBufferSection
             Section { link(.cloudCheck, "stethoscope") }
+        }
+    }
+
+    private var cloudAudioBufferSection: some View {
+        Section {
+            Picker("音频缓冲", selection: $cloudAudioBufferMode) {
+                ForEach(CloudAudioBufferMode.allCases, id: \.rawValue) { mode in
+                    Text(mode.title).tag(mode.rawValue)
+                }
+            }
+            .accessibilityIdentifier("settings.cloudAudioBufferMode")
+            .disabled(updateCallBusy)
+            if cloudAudioBufferMode == "manual" {
+                Picker("缓冲时长", selection: $cloudAudioBufferMilliseconds) {
+                    ForEach(CloudAudioBufferPolicy.manualChoices, id: \.self) { milliseconds in
+                        Text("\(milliseconds) ms").tag(milliseconds)
+                    }
+                }
+                .accessibilityIdentifier("settings.cloudAudioBufferMilliseconds")
+                .disabled(updateCallBusy)
+            }
+        } header: { Text("云端音频") } footer: {
+            Text("自动保持现有自适应策略；稳定优先使用 240–720 ms 缓冲。手动 720 ms 可用于弱网测试。缓冲越大，对话等待越明显，不能解决持续断网。仅影响云端播放，从下一通电话生效；新版安卓同步应用，旧 Agent 仅本机生效。")
         }
     }
 

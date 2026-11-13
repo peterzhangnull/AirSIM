@@ -28,6 +28,8 @@ import java.util.concurrent.Executors;
 /** AVF-free foreground Agent: Relay registration, heartbeat and command execution. */
 public final class StandaloneAgentService extends Service {
     private static final RelayEventQueue<String> CALL_EVENTS = new RelayEventQueue<>(RelayEgressGate.shared);
+    private static final com.airsim.phonecontrol.ServiceStartGate START_GATE =
+            new com.airsim.phonecontrol.ServiceStartGate();
     private static volatile StandaloneAgentService instance;
     private static final java.util.concurrent.atomic.AtomicBoolean manualHeartbeatRunning = new java.util.concurrent.atomic.AtomicBoolean();
     private final ExecutorService worker = Executors.newFixedThreadPool(3);
@@ -57,8 +59,10 @@ public final class StandaloneAgentService extends Service {
             (preferences, key) -> smsSnapshot();
 
     public static void start(Context context) {
-        try { context.startForegroundService(new Intent(context, StandaloneAgentService.class)); }
-        catch (RuntimeException error) { BridgeLog.error("standalone_agent_start_failed", error); }
+        try {
+            START_GATE.request(() -> context.startForegroundService(
+                    new Intent(context, StandaloneAgentService.class)) != null);
+        } catch (RuntimeException error) { BridgeLog.error("standalone_agent_start_failed", error); }
     }
 
     /** Explicit user action; call off the UI thread. Never enables cloud or bypasses the gate. */
@@ -78,7 +82,7 @@ public final class StandaloneAgentService extends Service {
         if (snapshot.scope() == null || !active.store.cloudEnabled())
             throw new IllegalStateException("云端未开启或尚未配对，请先检查云端配置");
         active.relay.postJSON(snapshot.registration(), "/v1/devices/register",
-                new JSONObject(snapshot.registration().toString()), 15_000, generation);
+                RelayRegistrationPayload.forRelay(snapshot.registration()), 15_000, generation);
         if (!generation.isCurrent() || !active.commandConfiguration.isCurrent(snapshot))
             throw new IllegalStateException("连接配置已变更，请重新发送");
         try {
@@ -103,13 +107,16 @@ public final class StandaloneAgentService extends Service {
 
     @Override public void onCreate() {
         super.onCreate();
+        // Android starts the FGS promotion deadline when startForegroundService() returns.
+        // Promote before any preference, disk, or Shizuku initialization can delay onCreate().
+        startForeground(BridgeNotification.WATCHDOG_ID,
+                BridgeNotification.startup(this, "内置 Agent 正在启动"),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING);
         store = new StandaloneAgentStore(this);
         relay = new StandaloneRelayClient();
-        startForeground(BridgeNotification.WATCHDOG_ID,
-                BridgeNotification.status(this, "内置 Agent 正在启动"),
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING);
         running = true;
         instance = this;
+        START_GATE.created(this);
         commandConfiguration = new RelayCommandConfiguration<>(store::registration, this::commandScope, commandRetry);
         getSharedPreferences("standalone_agent", MODE_PRIVATE).registerOnSharedPreferenceChangeListener(commandPreferences);
         ShizukuBridgeManager.get(this).ensureStarted();
@@ -193,7 +200,8 @@ public final class StandaloneAgentService extends Service {
     }
 
     private void syncRegistration(JSONObject registration) throws Exception {
-        int hash = registration.toString().hashCode();
+        JSONObject payload = RelayRegistrationPayload.forRelay(registration);
+        int hash = RelayRegistrationPayload.syncKey(registration).hashCode();
         // A Relay 401 means the device record is gone; re-post the unchanged registration. The
         // signal is one-shot, so a failed re-post waits for the next back-off window instead of
         // retrying every cycle.
@@ -202,7 +210,7 @@ public final class StandaloneAgentService extends Service {
         } else if (hash == syncedRegistrationHash) {
             return;
         }
-        relay.postJSON(registration, "/v1/devices/register", new JSONObject(registration.toString()), 15_000);
+        relay.postJSON(registration, "/v1/devices/register", payload, 15_000);
         syncedRegistrationHash = hash;
         store.recordSuccess();
         BridgeLog.info("standalone_relay_registration_synced");
@@ -431,14 +439,14 @@ public final class StandaloneAgentService extends Service {
         StandaloneSMSStore smsStore = new StandaloneSMSStore(this);
         JSONArray smsPending = smsStore.cloudPending();
         Map<String, JSONObject> events = new LinkedHashMap<>();
+        // With an E2E key for this registration every SMS goes up sealed (issue #24), never in plaintext.
+        byte[] e2eKey = E2EKeyStore.forRegistration(this, registration);
+        E2ESMSCrypto.Keys keys = e2eKey == null ? null : E2ESMSCrypto.keys(e2eKey);
         for (int index = 0; index < smsPending.length(); index++) {
             if (!generation.isCurrent()) return;
             JSONObject source = smsPending.getJSONObject(index);
-            events.put(source.getString("delivery_id"), identity(registration).put("event", "incoming_sms")
-                    .put("delivery_id", source.optString("delivery_id"))
-                    .put("sender", source.optString("sender")).put("content", source.optString("content"))
-                    .put("sim_slot", source.optString("sim_slot"))
-                    .put("timestamp", CloudSMSUploader.uploadTimestamp(source.optString("timestamp", ""), System.currentTimeMillis())));
+            String timestamp = CloudSMSUploader.uploadTimestamp(source.optString("timestamp", ""), System.currentTimeMillis());
+            events.put(source.getString("delivery_id"), CloudSMSEvent.body(identity(registration), source, timestamp, keys));
         }
         // One SMS the Relay refuses or cannot push must neither stall the others nor fail the agent cycle.
         smsUploader.flush(new ArrayList<>(events.keySet()),
@@ -455,7 +463,7 @@ public final class StandaloneAgentService extends Service {
                     }
                 }, this::smsFailure, android.os.SystemClock::elapsedRealtime,
                 () -> running && generation.isCurrent() && commandConfiguration.isCurrent(snapshot.configuration())
-                        && smsTransport.isCurrent(snapshot.epoch()));
+                        && smsTransport.isCurrent(snapshot.epoch()), keys != null);
     }
 
     private void smsFailure(Throwable smsError, CloudSMSUploader.Verdict verdict, int attempt, long pauseMillis) {
@@ -492,6 +500,7 @@ public final class StandaloneAgentService extends Service {
     @Override public void onDestroy() {
         running = false;
         if (instance == this) instance = null;
+        START_GATE.destroyed(this);
         eventWorker.shutdownNow();
         getSharedPreferences("standalone_agent", MODE_PRIVATE).unregisterOnSharedPreferenceChangeListener(commandPreferences);
         commandConfiguration.stop();
